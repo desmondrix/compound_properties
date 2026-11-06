@@ -9,7 +9,8 @@ from matplotlib.figure import Figure
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QComboBox, QSlider, QLabel, 
                              QTextEdit, QTableWidget, QTableWidgetItem, 
-                             QSplitter, QGroupBox, QMessageBox, QDoubleSpinBox)
+                             QSplitter, QGroupBox, QMessageBox, QDoubleSpinBox,
+                             QCompleter)
 from PyQt5.QtCore import Qt
 from PyQt5 import uic
 
@@ -19,6 +20,10 @@ CORROSION_FILE = 'corrosion_matrix'
 SEARCH_DIRS = [os.getcwd()]
 DEFAULT_TEMP_K = 298.15
 ANTOINE_PARAM_COUNT = 5
+
+# --- Unit conversion ---------------------------------------------------------
+BAR_TO_MMHG = 750.062
+CELSIUS_TO_KELVIN = 273.15
 
 # --- File / IO helpers -------------------------------------------------------
 def find_file(base_name):
@@ -53,11 +58,21 @@ def clean_name(name):
     name = re.sub(r'(\.\d+)$', '', name)
     return name.strip()
 
+def display_name(name):
+    """Keep base name; append (NIST) if the source column carries a nist tag."""
+    name = str(name)
+    base = clean_name(name)
+    if '(nist)' in name.lower():
+        return f"{base} (NIST)"
+    return base
+
 def unique_compounds(columns):
-    return {clean_name(c) for c in columns if not str(c).startswith('Unnamed')}
+    return {display_name(c) for c in columns if not str(c).startswith('Unnamed')}
 
 def compound_pattern(base_name):
     """Match the base name plus any '(nist)...' or '.N' variant."""
+    # Strip a trailing display '(NIST)' tag before building the pattern
+    base_name = re.sub(r'\s*\(nist\)\s*$', '', base_name, flags=re.IGNORECASE).strip()
     return rf"^{re.escape(base_name)}(\s*\(nist\).*|\.\d+)?$"
 
 # --- Initial load ------------------------------------------------------------
@@ -84,13 +99,34 @@ def antoine_pressure(A, B, C, T):
     """Vapor pressure from Antoine parameters (same units as the source data)."""
     return 10 ** (A - (B / (T + C)))
 
+def antoine_pressure_mmhg(A, B, C, T_kelvin, is_nist):
+    """
+    Evaluate Antoine pressure, returning mmHg, given a temperature in Kelvin.
+    (NIST): params expect Kelvin, output Bar  -> convert Bar->mmHg.
+    non-NIST: params expect Celsius, output mmHg -> convert K->C for input.
+    """
+    if is_nist:
+        T_native = T_kelvin                       # params use Kelvin
+        p_native = antoine_pressure(A, B, C, T_native)
+        return p_native * BAR_TO_MMHG             # Bar -> mmHg
+    else:
+        T_native = T_kelvin - CELSIUS_TO_KELVIN   # K -> C for params
+        return antoine_pressure(A, B, C, T_native)  # already mmHg
+
+def to_kelvin_bounds(T1, T2, is_nist):
+    """Convert a curve's native T bounds to Kelvin for plotting."""
+    if is_nist:
+        return T1, T2                                   # already Kelvin
+    return T1 + CELSIUS_TO_KELVIN, T2 + CELSIUS_TO_KELVIN  # Celsius -> Kelvin
+
 def parse_parameter_sets(df):
-    """Yield (col_name, A, B, C, T_min, T_max) for every valid column."""
+    """Yield (col_name, A, B, C, T_min, T_max, is_nist) for every valid column."""
     for col in df.columns:
+        is_nist = '(nist)' in str(col).lower()
         data = df[col].dropna().tolist()
         if len(data) >= ANTOINE_PARAM_COUNT:
             A, B, C, T1, T2 = (float(x) for x in data[:ANTOINE_PARAM_COUNT])
-            yield col, A, B, C, T1, T2
+            yield col, A, B, C, T1, T2, is_nist
 
 # --- Main Window -------------------------------------------------------------
 class ChemicalDashboard(QMainWindow):
@@ -122,6 +158,15 @@ class ChemicalDashboard(QMainWindow):
         self.compound_combo.addItems(self.compounds)
         self.compound_combo.setEditable(True)
         self.compound_combo.setMinimumWidth(300)
+        self.compound_combo.setInsertPolicy(QComboBox.NoInsert)
+
+        # --- Substring filtering completer ---
+        self.completer = QCompleter(self.compounds, self)
+        self.completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self.completer.setFilterMode(Qt.MatchContains)  # substring match
+        self.completer.setCompletionMode(QCompleter.PopupCompletion)
+        self.compound_combo.setCompleter(self.completer)
+
         self.compound_combo.currentTextChanged.connect(self.update_dashboard)
         
         temp_label = QLabel("Temperature (K):")
@@ -180,7 +225,9 @@ class ChemicalDashboard(QMainWindow):
         antoine_container = QWidget()
         antoine_layout = QVBoxLayout(antoine_container)
         antoine_layout.setContentsMargins(0, 5, 0, 0)
-        antoine_layout.addWidget(QLabel("<b>Antoine Parameters</b>"))
+        self.antoine_units_label = QLabel("<b>Antoine Parameters</b>")
+        self.antoine_units_label.setWordWrap(True)
+        antoine_layout.addWidget(self.antoine_units_label)
         self.antoine_table = QTableWidget()
         antoine_layout.addWidget(self.antoine_table)
         left_inner_splitter.addWidget(antoine_container)
@@ -251,7 +298,7 @@ class ChemicalDashboard(QMainWindow):
             self.info_text.append(f"Error: {str(e)}")
             
     def render_antoine(self, base_name, pattern, curr_t):
-        """Render Antoine pressure curves and data."""
+        """Render Antoine pressure curves and data (all in mmHg / Kelvin)."""
         df = read_matching(self.a_path, self.a_cols, pattern)
         self.info_text.clear()
         
@@ -261,14 +308,47 @@ class ChemicalDashboard(QMainWindow):
             self.canvas.draw()
             self.antoine_table.setRowCount(0)
             self.antoine_table.setColumnCount(0)
+            self.antoine_units_label.setText("<b>Antoine Parameters</b>")
             return
             
         sets = list(parse_parameter_sets(df))
         
-        # Update slider and spinbox bounds dynamically
-        if sets:
-            new_min = min(s[4] for s in sets)
-            new_max = max(s[5] for s in sets)
+        # Convert all bounds to Kelvin up front
+        kelvin_sets = []
+        for col, A, B, C, T1, T2, is_nist in sets:
+            k1, k2 = to_kelvin_bounds(T1, T2, is_nist)
+            kelvin_sets.append((col, A, B, C, k1, k2, is_nist))
+        
+        # Determine which source-unit systems are present for the label
+        has_nist = any(s[6] for s in sets)
+        has_non_nist = any(not s[6] for s in sets)
+        
+        if has_nist and has_non_nist:
+            units_note = ("Source units vary by column (see header badges): "
+                          "(NIST) in Bar &amp; Kelvin, others in mmHg &amp; Celsius. "
+                          "Plot normalized to mmHg &amp; Kelvin.")
+        elif has_nist:
+            units_note = ("Source units: Bar &amp; Kelvin (NIST). "
+                          "Plot normalized to mmHg &amp; Kelvin.")
+        else:
+            units_note = ("Source units: mmHg &amp; Celsius. "
+                          "Plot normalized to mmHg &amp; Kelvin.")
+        
+        self.antoine_units_label.setText(
+            f"<b>Antoine Parameters</b><br><span style='font-weight:normal; "
+            f"font-size:11px;'>{units_note}</span>"
+        )
+        
+        # Build per-column unit badges for the table headers
+        # (maps each raw column name to a "[Bar/K]" or "[mmHg/°C]" badge)
+        col_units = {}
+        for col, A, B, C, T1, T2, is_nist in sets:
+            col_units[str(col)] = "[Bar/K]" if is_nist else "[mmHg/\u00b0C]"
+        
+        # Update slider and spinbox bounds dynamically (now in Kelvin)
+        if kelvin_sets:
+            new_min = min(s[4] for s in kelvin_sets)
+            new_max = max(s[5] for s in kelvin_sets)
             
             # Safeguard edge case scenario where parameter profile limits evaluate flat
             if new_min >= new_max:
@@ -291,12 +371,13 @@ class ChemicalDashboard(QMainWindow):
         self.ax.clear()
         
         valid = 0
-        for col, A, B, C, T1, T2 in sets:
-            tr = np.linspace(T1, T2, 100)
-            self.ax.plot(tr, antoine_pressure(A, B, C, tr), label=str(col))
-            if T1 <= curr_t <= T2:
-                p = antoine_pressure(A, B, C, curr_t)
-                self.info_text.append(f"Parameter set {col}: P={p:.4f} Bar")
+        for col, A, B, C, k1, k2, is_nist in kelvin_sets:
+            tr = np.linspace(k1, k2, 100)   # Kelvin axis
+            pr = antoine_pressure_mmhg(A, B, C, tr, is_nist)  # mmHg
+            self.ax.plot(tr, pr, label=str(col))
+            if k1 <= curr_t <= k2:
+                p = antoine_pressure_mmhg(A, B, C, curr_t, is_nist)
+                self.info_text.append(f"Parameter set {col}: P={p:.4f} mmHg")
                 valid += 1
                 
         if valid == 0:
@@ -306,17 +387,14 @@ class ChemicalDashboard(QMainWindow):
                         label=f'Current: {curr_t:.1f}K')
         self.ax.set_title(f"Combined Vapor Pressure Curves for: {base_name}")
         self.ax.set_xlabel("Temperature (K)")
-        
-        # Applied proper scaling fixes instead of conflicting plain linear display
-        #self.ax.set_yscale('log')
-        self.ax.set_ylabel("Pressure (Bar)")
+        self.ax.set_ylabel("Pressure (mmHg)")
         
         self.ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         self.ax.grid(True, which="both", alpha=0.3)
         self.figure.tight_layout()
         self.canvas.draw()
         
-        self.display_dataframe(df, self.antoine_table)
+        self.display_dataframe(df, self.antoine_table, col_units=col_units)
         
     def render_corrosion(self, base_name, pattern):
         """Render corrosion data table."""
@@ -329,12 +407,23 @@ class ChemicalDashboard(QMainWindow):
         else:
             self.display_dataframe(df, self.corrosion_table)
             
-    def display_dataframe(self, df, table_widget):
-        """Display a pandas DataFrame in a QTableWidget."""
+    def display_dataframe(self, df, table_widget, col_units=None):
+        """Display a pandas DataFrame in a QTableWidget.
+
+        If col_units is provided (dict mapping column name -> unit badge str),
+        the badge is appended to the corresponding column header.
+        """
         table_widget.setRowCount(df.shape[0])
         table_widget.setColumnCount(df.shape[1])
         
-        table_widget.setHorizontalHeaderLabels([str(col) for col in df.columns])
+        headers = []
+        for col in df.columns:
+            label = str(col)
+            if col_units and str(col) in col_units:
+                label = f"{label}\n{col_units[str(col)]}"
+            headers.append(label)
+        
+        table_widget.setHorizontalHeaderLabels(headers)
         table_widget.setVerticalHeaderLabels([str(idx) for idx in df.index])
         
         for i in range(df.shape[0]):
